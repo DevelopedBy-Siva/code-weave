@@ -1,1 +1,0 @@
-"""PyAssist CLI package."""

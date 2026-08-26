@@ -1,288 +1,140 @@
-"""Fine-tune Qwen2.5-Coder-14B on Python instruction data with Unsloth LoRA."""
+"""Fine-tune Qwen2.5-Coder-7B-Instruct on cleaned Python instruction data."""
 
-import unsloth
+from __future__ import annotations
 
-import os
+import argparse
 import inspect
-import torch
+import json
 import logging
 from pathlib import Path
-from dataclasses import dataclass
-from datasets import load_dataset, concatenate_datasets, Dataset
-from transformers import (
-    Trainer,
-    TrainingArguments,
-    DataCollatorForSeq2Seq,
-    EarlyStoppingCallback,
-)
+from typing import Any
+
+import torch
+from datasets import Dataset
+from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer, TrainingArguments
 from unsloth import FastLanguageModel
 
-BASE_DIR = Path(__file__).resolve().parent
-TRAINING_LOG = BASE_DIR / "training.log"
+from model.config import AppConfig, add_config_arguments, apply_overrides, default_config
+from model.model_registry import save_merged_model
 
-@dataclass
-class Config:
-    model_name: str     = "Qwen/Qwen2.5-Coder-14B-Instruct"
-    max_seq_length: int = 4096
-    load_in_4bit: bool  = False
-
-    lora_r: int         = 64
-    lora_alpha: int     = 128
-    lora_dropout: float = 0.0
-    target_modules: tuple = (
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    )
-
-    output_dir: str                  = str(BASE_DIR / "qwen-python-finetuned")
-    num_train_epochs: int            = 1
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 4
-    warmup_steps: int                = 100
-    learning_rate: float             = 1e-4
-    lr_scheduler_type: str           = "cosine"
-    weight_decay: float              = 0.01
-    bf16: bool                       = True
-    fp16: bool                       = False
-    logging_steps: int               = 25
-    save_steps: int                  = 500
-    eval_steps: int                  = 500
-    save_total_limit: int            = 3
-    load_best_model_at_end: bool     = True
-    optim: str                       = "adamw_8bit"
-    seed: int                        = 42
-
-    val_split: float = 0.02
-    max_samples: int = None
-
-
-cfg = Config()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(TRAINING_LOG),
-    ]
-)
+TRAINING_LOG = Path(__file__).resolve().parent / "training.log"
 logger = logging.getLogger(__name__)
 
-FOREIGN_EOS = ["<EOS_TOKEN>", "</s>", "<eos>", "<|endoftext|>", "<|eot_id|>"]
 
-def load_and_merge_datasets() -> Dataset:
-    """Load, normalize, and combine the training datasets."""
-    logger.info("Loading datasets...")
-    all_datasets = []
-
-    try:
-        ds = load_dataset("Vezora/Tested-22k-Python-Alpaca", split="train")
-        logger.info(f"  Vezora:          {len(ds):>6} samples")
-        all_datasets.append(ds)
-    except Exception as e:
-        logger.warning(f"  Vezora failed: {e}")
-
-    try:
-        ds = load_dataset("iamtarun/python_code_instructions_18k_alpaca", split="train")
-        logger.info(f"  iamtarun:        {len(ds):>6} samples")
-        all_datasets.append(ds)
-    except Exception as e:
-        logger.warning(f"  iamtarun failed: {e}")
-
-    try:
-        ds = load_dataset("flytech/python-codes-25k", split="train")
-        logger.info(f"  flytech:         {len(ds):>6} samples")
-        all_datasets.append(ds)
-    except Exception as e:
-        logger.warning(f"  flytech failed: {e}")
-
-    try:
-        ds = load_dataset("ise-uiuc/Magicoder-OSS-Instruct-75K", split="train")
-        ds = ds.filter(lambda x: x.get("lang", "").lower() == "python")
-        ds = ds.map(lambda x: {
-            "instruction": x.get("problem", ""),
-            "input":       "",
-            "output":      x.get("solution", ""),
-        })
-        logger.info(f"  Magicoder (py):  {len(ds):>6} samples")
-        all_datasets.append(ds)
-    except Exception as e:
-        logger.warning(f"  Magicoder failed: {e}")
-
-    try:
-        ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
-        ds = ds.filter(lambda x: "python" in x.get("output", "").lower())
-        logger.info(f"  CodeAlpaca (py): {len(ds):>6} samples")
-        all_datasets.append(ds)
-    except Exception as e:
-        logger.warning(f"  CodeAlpaca failed: {e}")
-
-    if not all_datasets:
-        raise RuntimeError("No datasets loaded!")
-
-    def normalize(example):
-        return {
-            "instruction": str(example.get("instruction", "") or ""),
-            "input":       str(example.get("input",       "") or ""),
-            "output":      str(example.get("output",      "") or ""),
-        }
-
-    normalized = [ds.map(normalize, remove_columns=ds.column_names) for ds in all_datasets]
-    combined   = concatenate_datasets(normalized)
-    logger.info(f"  Combined raw: {len(combined)} samples")
-    return combined
+def setup_logging() -> None:
+    """Configure console and file logging."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(TRAINING_LOG)],
+    )
 
 
-def clean_dataset(dataset: Dataset) -> Dataset:
-    """Drop noisy examples and simple near-duplicates."""
-    logger.info("Cleaning dataset...")
+def load_clean_dataset(config: AppConfig) -> Dataset:
+    """Load processed instruction data from data/processed/cleaned_data.json."""
+    if not config.cleaned_data_path.exists():
+        raise FileNotFoundError(
+            f"Missing {config.cleaned_data_path}. Run `python data/download_datasets.py --download --clean --validate` first."
+        )
+    with config.cleaned_data_path.open("r", encoding="utf-8") as handle:
+        records = json.load(handle)
+    logger.info("Loaded %s cleaned samples from %s", len(records), config.cleaned_data_path)
+    return Dataset.from_list(records)
 
-    def strip_and_clean(example):
-        out = example.get("output", "")
-        ins = example.get("instruction", "")
-        for tok in FOREIGN_EOS:
-            out = out.replace(tok, "")
-            ins = ins.replace(tok, "")
-        return {
-            "instruction": ins.strip(),
-            "input":       example.get("input", ""),
-            "output":      out.strip(),
-        }
 
-    dataset = dataset.map(strip_and_clean)
+def tokenize_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> Dataset:
+    """Pre-tokenize examples for Hugging Face Trainer."""
+    eos_token = tokenizer.eos_token
 
-    python_kw = ["def ", "import ", "class ", "return ", "print(", "for ", "if "]
-
-    def quality_ok(ex):
-        out = ex.get("output", "")
-        ins = ex.get("instruction", "")
-        if len(out) < 50 or len(out) > 4000:        return False
-        if len(ins) < 10:                             return False
-        if not any(k in out for k in python_kw):     return False
-        return True
-
-    dataset = dataset.filter(quality_ok)
-    logger.info(f"  After quality filter: {len(dataset)}")
-
-    seen = set()
-    def is_unique(ex):
-        k = ex["instruction"][:100].strip().lower()
-        if k in seen: return False
-        seen.add(k); return True
-
-    dataset = dataset.filter(is_unique)
-    logger.info(f"  After dedup:          {len(dataset)}")
-    return dataset
-
-def tokenize_dataset(dataset: Dataset, tokenizer) -> Dataset:
-    """Pre-tokenize examples for the plain Hugging Face Trainer."""
-    logger.info("Tokenizing...")
-    EOS = tokenizer.eos_token
-
-    def tokenize(example):
-        inp = example.get("input", "").strip()
-        input_section = f"\n\n### Input:\n{inp}" if inp else ""
+    def tokenize(example: dict[str, str]) -> dict[str, Any]:
+        input_section = f"\n\n### Input:\n{example['input'].strip()}" if example.get("input", "").strip() else ""
         text = (
             f"### Instruction:\n{example['instruction'].strip()}"
             f"{input_section}\n\n"
             f"### Response:\n{example['output'].strip()}"
-            f"{EOS}"
+            f"{eos_token}"
         )
-        result = tokenizer(
-            text,
-            truncation=True,
-            max_length=cfg.max_seq_length,
-            padding=False,
-        )
+        result = tokenizer(text, truncation=True, max_length=config.model.max_seq_length, padding=False)
         result["labels"] = result["input_ids"].copy()
         return result
 
-    tokenized = dataset.map(
-        tokenize,
-        remove_columns=["instruction", "input", "output"],
-        num_proc=4,
-    )
-    logger.info(f"  Tokenized: {len(tokenized)} samples")
+    tokenized = dataset.map(tokenize, remove_columns=["instruction", "input", "output"], num_proc=4)
+    logger.info("Tokenized %s samples", len(tokenized))
     return tokenized
 
 
-def prepare_dataset(dataset: Dataset, tokenizer):
-    """Tokenize and split the dataset into train and eval sets."""
-    if cfg.max_samples and len(dataset) > cfg.max_samples:
-        dataset = dataset.shuffle(seed=cfg.seed).select(range(cfg.max_samples))
+def prepare_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> tuple[Dataset, Dataset]:
+    """Tokenize and split the dataset into train/eval sets."""
+    if config.training.max_samples and len(dataset) > config.training.max_samples:
+        dataset = dataset.shuffle(seed=config.training.seed).select(range(config.training.max_samples))
 
-    tokenized = tokenize_dataset(dataset, tokenizer)
-    split     = tokenized.train_test_split(test_size=cfg.val_split, seed=cfg.seed)
-    logger.info(f"  Train: {len(split['train'])}  |  Val: {len(split['test'])}")
+    tokenized = tokenize_dataset(dataset, tokenizer, config)
+    split = tokenized.train_test_split(test_size=config.training.val_split, seed=config.training.seed)
+    logger.info("Train: %s | Val: %s", len(split["train"]), len(split["test"]))
     return split["train"], split["test"]
 
-def load_model():
+
+def load_lora_model(config: AppConfig) -> tuple[Any, Any]:
     """Load the base model and attach LoRA adapters."""
-    logger.info(f"Loading: {cfg.model_name}")
+    logger.info("Loading model: %s", config.model.model_name)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name     = cfg.model_name,
-        max_seq_length = cfg.max_seq_length,
-        load_in_4bit   = cfg.load_in_4bit,
-        dtype          = torch.bfloat16,
+        model_name=config.model.model_name,
+        max_seq_length=config.model.max_seq_length,
+        load_in_4bit=config.model.load_in_4bit,
+        dtype=torch.bfloat16,
     )
-    logger.info(f"EOS token: '{tokenizer.eos_token}' (id={tokenizer.eos_token_id})")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     model = FastLanguageModel.get_peft_model(
         model,
-        r                          = cfg.lora_r,
-        lora_alpha                 = cfg.lora_alpha,
-        lora_dropout               = cfg.lora_dropout,
-        target_modules             = list(cfg.target_modules),
-        bias                       = "none",
-        use_gradient_checkpointing = "unsloth",
-        random_state               = cfg.seed,
+        r=config.lora.r,
+        lora_alpha=config.lora.alpha,
+        lora_dropout=config.lora.dropout,
+        target_modules=list(config.lora.target_modules),
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=config.training.seed,
     )
 
-    total     = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    logger.info("Trainable parameters: %s / %s (%.2f%%)", f"{trainable:,}", f"{total:,}", 100 * trainable / total)
     return model, tokenizer
 
-def train(model, tokenizer, train_dataset, eval_dataset):
-    """Train the model with the standard Hugging Face Trainer."""
-    logger.info("Configuring Trainer...")
 
+def train_model(model: Any, tokenizer: Any, train_dataset: Dataset, eval_dataset: Dataset, config: AppConfig) -> Trainer:
+    """Train the model with Hugging Face Trainer."""
     training_args = TrainingArguments(
-        output_dir                  = cfg.output_dir,
-        num_train_epochs            = cfg.num_train_epochs,
-        per_device_train_batch_size = cfg.per_device_train_batch_size,
-        gradient_accumulation_steps = cfg.gradient_accumulation_steps,
-        warmup_steps                = cfg.warmup_steps,
-        learning_rate               = cfg.learning_rate,
-        lr_scheduler_type           = cfg.lr_scheduler_type,
-        weight_decay                = cfg.weight_decay,
-        optim                       = cfg.optim,
-        bf16                        = cfg.bf16,
-        fp16                        = cfg.fp16,
-        logging_steps               = cfg.logging_steps,
-        save_steps                  = cfg.save_steps,
-        save_strategy               = "steps",
-        save_total_limit            = cfg.save_total_limit,
-        eval_strategy               = "steps",
-        eval_steps                  = cfg.eval_steps,
-        load_best_model_at_end      = cfg.load_best_model_at_end,
-        metric_for_best_model       = "eval_loss",
-        greater_is_better           = False,
-        seed                        = cfg.seed,
-        report_to                   = "none",
-        dataloader_num_workers      = 4,
-        remove_unused_columns       = False,
+        output_dir=str(config.output_dir),
+        num_train_epochs=config.training.num_train_epochs,
+        per_device_train_batch_size=config.training.per_device_train_batch_size,
+        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
+        max_grad_norm=config.training.max_grad_norm,
+        warmup_steps=config.training.warmup_steps,
+        learning_rate=config.training.learning_rate,
+        lr_scheduler_type=config.training.lr_scheduler_type,
+        weight_decay=config.training.weight_decay,
+        optim=config.training.optim,
+        bf16=config.training.bf16,
+        fp16=config.training.fp16,
+        logging_steps=config.training.logging_steps,
+        save_steps=config.training.save_steps,
+        save_strategy="steps",
+        save_total_limit=config.training.save_total_limit,
+        eval_strategy="steps",
+        eval_steps=config.training.eval_steps,
+        load_best_model_at_end=config.training.load_best_model_at_end,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        seed=config.training.seed,
+        report_to="none",
+        dataloader_num_workers=4,
+        remove_unused_columns=False,
     )
 
-    collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model           = model,
-        padding         = True,
-        pad_to_multiple_of = 8,
-        label_pad_token_id = -100,
-    )
-
-    trainer_kwargs = {
+    collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True, pad_to_multiple_of=8, label_pad_token_id=-100)
+    trainer_kwargs: dict[str, Any] = {
         "model": model,
         "args": training_args,
         "train_dataset": train_dataset,
@@ -296,82 +148,47 @@ def train(model, tokenizer, train_dataset, eval_dataset):
         trainer_kwargs["processing_class"] = tokenizer
     elif "tokenizer" in trainer_init_params:
         trainer_kwargs["tokenizer"] = tokenizer
-    else:
-        logger.warning(
-            "Trainer.__init__ accepts neither 'processing_class' nor 'tokenizer'; "
-            "continuing without attaching the tokenizer."
-        )
 
     trainer = Trainer(**trainer_kwargs)
-
     if torch.cuda.is_available():
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {gpu_mem:.1f} GB")
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info("GPU: %s | VRAM: %.1f GB", torch.cuda.get_device_name(0), gpu_memory)
 
-    logger.info("Training started...")
     stats = trainer.train()
-    logger.info(f"Done!")
-    logger.info(f"  Loss:        {stats.metrics['train_loss']:.4f}")
-    logger.info(f"  Runtime:     {stats.metrics['train_runtime']:.0f}s")
-    logger.info(f"  Samples/sec: {stats.metrics['train_samples_per_second']:.1f}")
+    logger.info("Training complete: loss=%.4f runtime=%.0fs", stats.metrics["train_loss"], stats.metrics["train_runtime"])
     return trainer
 
-def save_model(model, tokenizer):
-    """Save both the LoRA adapter and merged full model."""
-    lora_path   = os.path.join(cfg.output_dir, "lora_adapter")
-    merged_path = os.path.join(cfg.output_dir, "merged_model")
 
-    model.save_pretrained(lora_path)
-    tokenizer.save_pretrained(lora_path)
-    logger.info(f"LoRA adapter  -> {lora_path}")
+def save_model_artifacts(model: Any, tokenizer: Any, config: AppConfig) -> None:
+    """Save LoRA adapter and merged model artifacts."""
+    adapter_path = config.output_dir / "lora_adapter"
+    merged_path = config.output_dir / "merged_model"
+    adapter_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(adapter_path))
+    tokenizer.save_pretrained(str(adapter_path))
+    logger.info("LoRA adapter saved to %s", adapter_path)
+    save_merged_model(model, tokenizer, merged_path)
+    logger.info("Merged model saved to %s", merged_path)
 
-    logger.info("Merging LoRA weights into base model...")
-    model.save_pretrained_merged(merged_path, tokenizer, save_method="merged_16bit")
-    logger.info(f"Merged model  -> {merged_path}")
 
-def test_inference(model, tokenizer):
-    """Run a small generation smoke test."""
-    logger.info("Quick inference test...")
-    FastLanguageModel.for_inference(model)
+def parse_args() -> argparse.Namespace:
+    """Parse training CLI arguments."""
+    parser = argparse.ArgumentParser(description="Fine-tune PyCodeGen with LoRA.")
+    add_config_arguments(parser)
+    return parser.parse_args()
 
-    prompts = [
-        "Write a Python function to flatten a nested list",
-        "Write a Python decorator that retries a function 3 times on exception",
-        "Create a Python context manager for timing code blocks",
-    ]
 
-    for prompt in prompts:
-        text   = f"### Instruction:\n{prompt}\n\n### Response:\n"
-        inputs = tokenizer(text, return_tensors="pt").to("cuda")
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens = 300,
-                temperature    = 0.2,
-                top_p          = 0.95,
-                do_sample      = True,
-                pad_token_id   = tokenizer.eos_token_id,
-            )
-        print(f"\n{'='*60}\n{prompt}\n{'='*60}")
-        print(tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
-
-def main():
-    logger.info("=" * 60)
-    logger.info("Qwen2.5-Coder-14B  |  Python Fine-tuning")
-    logger.info("HuggingFace Trainer + Unsloth LoRA")
-    logger.info("=" * 60)
-
-    model, tokenizer  = load_model()
-
-    raw               = load_and_merge_datasets()
-    clean             = clean_dataset(raw)
-    train_ds, eval_ds = prepare_dataset(clean, tokenizer)
-
-    trainer           = train(model, tokenizer, train_ds, eval_ds)
-    save_model(model, tokenizer)
-    test_inference(model, tokenizer)
-
-    logger.info(f"All done -> {cfg.output_dir}")
+def main() -> None:
+    """Run the end-to-end training job."""
+    setup_logging()
+    config = apply_overrides(default_config(), parse_args())
+    logger.info("Qwen2.5-Coder 7B | Python fine-tuning | Unsloth LoRA")
+    model, tokenizer = load_lora_model(config)
+    dataset = load_clean_dataset(config)
+    train_dataset, eval_dataset = prepare_dataset(dataset, tokenizer, config)
+    train_model(model, tokenizer, train_dataset, eval_dataset, config)
+    save_model_artifacts(model, tokenizer, config)
+    logger.info("All done: %s", config.output_dir)
 
 
 if __name__ == "__main__":
