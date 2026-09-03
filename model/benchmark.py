@@ -17,8 +17,8 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
-from model.config import default_config
-from model.model_registry import format_prompt, load_model as registry_load_model, load_tokenizer
+from config import default_config
+from model_registry import format_prompt, load_model as registry_load_model, load_tokenizer
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = BASE_DIR / "benchmark_results"

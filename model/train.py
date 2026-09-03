@@ -14,8 +14,8 @@ from datasets import Dataset
 from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer, TrainingArguments
 from unsloth import FastLanguageModel
 
-from model.config import AppConfig, add_config_arguments, apply_overrides, default_config
-from model.model_registry import save_merged_model
+from config import AppConfig, add_config_arguments, apply_overrides, default_config
+from model_registry import save_merged_model
 
 TRAINING_LOG = Path(__file__).resolve().parent / "training.log"
 logger = logging.getLogger(__name__)

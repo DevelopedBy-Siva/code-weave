@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from model.config import default_config
+from config import default_config
 
 INSTRUCTION_TEMPLATES = {
     "generate": "Write Python code for the following request.",

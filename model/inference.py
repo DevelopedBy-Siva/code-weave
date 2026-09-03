@@ -8,8 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from model.config import InferenceConfig, default_config
-from model.model_registry import format_prompt, load_model, load_tokenizer
+from config import InferenceConfig, default_config
+from model_registry import format_prompt, load_model, load_tokenizer
 
 SUPPORTED_TASKS = ("generate", "explain", "review", "chat")
 

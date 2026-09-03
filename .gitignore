@@ -1,16 +1,52 @@
-*.pth
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# Model checkpoints and weights
 *.pt
+*.pth
 *.bin
 *.safetensors
 model/qwen-python-finetuned/
 model/benchmark_results/
+
+# Training artifacts
 model/*.log
+trainer_state.json
+optimizer.pt
+scheduler.pt
+rng_state.pth
+
+# Dataset files
 data/raw/
-.env
-__pycache__/
-*.pyc
-.venv/
-*.egg-info/
-.DS_Store
-.mypy_cache/
-.pytest_cache/
+data/processed/
+
+# Unsloth cache
+unsloth_compiled_cache/
+
+# Hugging Face cache (if created locally)
+.cache/
+hf_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
