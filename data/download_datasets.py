@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import difflib
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,31 +73,70 @@ def quality_ok(example: dict[str, str]) -> bool:
     output = example.get("output", "").strip()
     return 10 <= len(instruction) and 20 <= len(output) <= 8_000
 
-def load_benchmark_snippets(min_chars: int = 60) -> list[str]:
-    """Load normalized HumanEval prompt+solution text to screen training data against."""
+def normalize_code(text: str) -> str:
+    """Collapse whitespace for code-level comparison, ignoring formatting differences."""
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+FUNC_DEF_RE = re.compile(r"def\s+(\w+)\s*\(")
+
+
+def load_benchmark_signals(min_solution_chars: int = 40) -> dict[str, dict[str, str]]:
+    """Load HumanEval solutions and problem text, keyed by entry_point, to screen training data against."""
     from datasets import load_dataset
 
     humaneval = load_dataset("openai/openai_humaneval", split="test")
-    snippets = [
-        normalize_for_dedup({"instruction": row["prompt"], "input": "", "output": row["canonical_solution"]})
-        for row in humaneval
-    ]
-    return [snippet for snippet in snippets if len(snippet) >= min_chars]
+    signals: dict[str, dict[str, str]] = {}
+    for row in humaneval:
+        solution_norm = normalize_code(row["canonical_solution"])
+        if len(solution_norm) < min_solution_chars:
+            continue
+        signals[row["entry_point"]] = {
+            "task_id": row["task_id"],
+            "prompt_norm": normalize_code(row["prompt"]),
+            "solution_norm": solution_norm,
+        }
+    return signals
 
 
-def is_benchmark_contaminated(example: dict[str, str], benchmark_snippets: list[str], window: int = 60) -> bool:
-    """Flag training examples that closely overlap with eval benchmark content."""
-    combined = normalize_for_dedup(example)
-    return any(snippet[:window] in combined for snippet in benchmark_snippets)
+def is_benchmark_contaminated(
+    example: dict[str, str],
+    signals: dict[str, dict[str, str]],
+    code_ratio_threshold: float = 0.75,
+    text_window: int = 60,
+) -> tuple[bool, str]:
+    """Flag a training example whose code closely matches a HumanEval solution under the
+    same function name, or whose instruction text closely matches a HumanEval prompt.
+    Returns (is_contaminated, reason) for auditability.
+    """
+    output = example.get("output", "")
+    output_norm = normalize_code(output)
+
+    for name in FUNC_DEF_RE.findall(output):
+        signal = signals.get(name)
+        if signal is None:
+            continue
+        ratio = difflib.SequenceMatcher(None, output_norm, signal["solution_norm"]).quick_ratio()
+        if ratio >= code_ratio_threshold:
+            return True, f"code match: {signal['task_id']} (entry_point={name}, ratio={ratio:.2f})"
+
+    instruction_input_norm = normalize_code(f"{example.get('instruction', '')} {example.get('input', '')}")
+    for signal in signals.values():
+        prefix = signal["prompt_norm"][:text_window]
+        if prefix and prefix in instruction_input_norm:
+            return True, f"prompt-text match: {signal['task_id']}"
+
+    return False, ""
 
 def clean_records(
     records: Iterable[dict[str, Any]],
-    benchmark_snippets: list[str] | None = None,
-) -> tuple[list[dict[str, str]], CleaningStats]:
+    benchmark_signals: dict[str, dict[str, str]] | None = None,
+) -> tuple[list[dict[str, str]], CleaningStats, list[dict[str, str]]]:
     """Clean records, remove non-Python data, and deduplicate examples."""
     stats = CleaningStats()
     seen: set[str] = set()
     cleaned_records: list[dict[str, str]] = []
+    flagged: list[dict[str, str]] = []
 
     for record in records:
         stats.raw += 1
@@ -112,9 +152,12 @@ def clean_records(
         if not quality_ok(example):
             stats.quality_removed += 1
             continue
-        if benchmark_snippets and is_benchmark_contaminated(example, benchmark_snippets):
-            stats.benchmark_removed += 1
-            continue
+        if benchmark_signals:
+            contaminated, reason = is_benchmark_contaminated(example, benchmark_signals)
+            if contaminated:
+                stats.benchmark_removed += 1
+                flagged.append({**example, "reason": reason})
+                continue
         dedup_key = normalize_for_dedup(example)
         if dedup_key in seen:
             stats.duplicate_removed += 1
@@ -123,7 +166,7 @@ def clean_records(
         cleaned_records.append(example)
 
     stats.kept = len(cleaned_records)
-    return cleaned_records, stats
+    return cleaned_records, stats, flagged
 
 
 def normalize_hf_record(dataset_name: str, record: dict[str, Any]) -> dict[str, str] | None:
@@ -182,18 +225,20 @@ def run_download() -> list[dict[str, str]]:
     return records
 
 
-def run_clean(records: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, str]], CleaningStats]:
+def run_clean(records: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, str]], CleaningStats, list[dict[str, str]]]:
     """Clean raw records and save processed data plus stats."""
     if records is None:
         records = run_download() if not RAW_DATA_PATH.exists() else read_json(RAW_DATA_PATH)
     logger.info("Loading HumanEval to screen for contamination")
-    benchmark_snippets = load_benchmark_snippets()
-    cleaned, stats = clean_records(records, benchmark_snippets=benchmark_snippets)
+    benchmark_signals = load_benchmark_signals()
+    cleaned, stats, flagged = clean_records(records, benchmark_signals=benchmark_signals)
     write_json(CLEANED_DATA_PATH, cleaned)
     write_json(STATS_PATH, asdict(stats))
+    if flagged:
+        write_json(PROCESSED_DIR / "benchmark_contamination_flagged.json", flagged)
     logger.info("Cleaning stats: %s", asdict(stats))
     logger.info("Saved %s cleaned records to %s", len(cleaned), CLEANED_DATA_PATH)
-    return cleaned, stats
+    return cleaned, stats, flagged
 
 
 def run_validate() -> None:

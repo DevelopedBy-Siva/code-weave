@@ -49,7 +49,7 @@ class PyCodeGenPredictor:
         max_tokens = max_new_tokens or self.generation_config.max_new_tokens
         temp = self.generation_config.temperature if temperature is None else temperature
         nucleus = self.generation_config.top_p if top_p is None else top_p
-        input_text = format_prompt(prompt, task=task)
+        input_text = format_prompt(prompt, self.tokenizer, task=task)
         inputs = self.tokenizer(input_text, return_tensors="pt")
         if hasattr(inputs, "to"):
             inputs = inputs.to(self.model.device)

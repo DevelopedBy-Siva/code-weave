@@ -9,10 +9,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from unsloth import FastLanguageModel
+
 import torch
 from datasets import Dataset
 from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer, TrainingArguments
-from unsloth import FastLanguageModel
 
 from config import AppConfig, add_config_arguments, apply_overrides, default_config
 from model_registry import INSTRUCTION_TEMPLATES, save_merged_model
@@ -60,14 +61,29 @@ def tokenize_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> Dat
         result = tokenizer(full_text, truncation=True, max_length=config.model.max_seq_length, add_special_tokens=False)
 
         labels = result["input_ids"].copy()
-        labels[: min(prompt_len, len(labels))] = [-100] * min(prompt_len, len(labels))
+        masked_len = min(prompt_len, len(labels))
+        labels[:masked_len] = [-100] * masked_len
+
         result["labels"] = labels
+        result["has_supervision"] = any(label != -100 for label in labels)
         return result
 
-    tokenized = dataset.map(tokenize, remove_columns=["instruction", "input", "output"], num_proc=4)
-    logger.info("Tokenized %s samples", len(tokenized))
-    return tokenized
+    tokenized = dataset.map(
+        tokenize,
+        remove_columns=["instruction", "input", "output"],
+        num_proc=4,
+    )
 
+    before_filter = len(tokenized)
+    tokenized = tokenized.filter(lambda example: example["has_supervision"], num_proc=4)
+    tokenized = tokenized.remove_columns(["has_supervision"])
+
+    logger.info(
+        "Tokenized %s samples; kept %s with supervised response tokens",
+        before_filter,
+        len(tokenized),
+    )
+    return tokenized
 
 def prepare_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> tuple[Dataset, Dataset]:
     """Tokenize and split the dataset into train/eval sets."""
