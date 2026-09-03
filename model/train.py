@@ -15,7 +15,7 @@ from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer,
 from unsloth import FastLanguageModel
 
 from config import AppConfig, add_config_arguments, apply_overrides, default_config
-from model_registry import save_merged_model
+from model_registry import INSTRUCTION_TEMPLATES, save_merged_model
 
 TRAINING_LOG = Path(__file__).resolve().parent / "training.log"
 logger = logging.getLogger(__name__)
@@ -43,19 +43,25 @@ def load_clean_dataset(config: AppConfig) -> Dataset:
 
 
 def tokenize_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> Dataset:
-    """Pre-tokenize examples for Hugging Face Trainer."""
-    eos_token = tokenizer.eos_token
+    """Tokenize examples using the chat template, masking the prompt from the loss."""
 
     def tokenize(example: dict[str, str]) -> dict[str, Any]:
-        input_section = f"\n\n### Input:\n{example['input'].strip()}" if example.get("input", "").strip() else ""
-        text = (
-            f"### Instruction:\n{example['instruction'].strip()}"
-            f"{input_section}\n\n"
-            f"### Response:\n{example['output'].strip()}"
-            f"{eos_token}"
-        )
-        result = tokenizer(text, truncation=True, max_length=config.model.max_seq_length, padding=False)
-        result["labels"] = result["input_ids"].copy()
+        user_content = example["instruction"].strip()
+        if example.get("input", "").strip():
+            user_content += f"\n\n{example['input'].strip()}"
+        messages = [
+            {"role": "system", "content": INSTRUCTION_TEMPLATES["generate"]},
+            {"role": "user", "content": user_content},
+        ]
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        full_text = prompt_text + example["output"].strip() + tokenizer.eos_token
+
+        prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+        result = tokenizer(full_text, truncation=True, max_length=config.model.max_seq_length, add_special_tokens=False)
+
+        labels = result["input_ids"].copy()
+        labels[: min(prompt_len, len(labels))] = [-100] * min(prompt_len, len(labels))
+        result["labels"] = labels
         return result
 
     tokenized = dataset.map(tokenize, remove_columns=["instruction", "input", "output"], num_proc=4)

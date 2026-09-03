@@ -39,6 +39,7 @@ class CleaningStats:
     non_python_removed: int = 0
     quality_removed: int = 0
     duplicate_removed: int = 0
+    benchmark_removed: int = 0
     kept: int = 0
 
 
@@ -71,8 +72,27 @@ def quality_ok(example: dict[str, str]) -> bool:
     output = example.get("output", "").strip()
     return 10 <= len(instruction) and 20 <= len(output) <= 8_000
 
+def load_benchmark_snippets(min_chars: int = 60) -> list[str]:
+    """Load normalized HumanEval prompt+solution text to screen training data against."""
+    from datasets import load_dataset
 
-def clean_records(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, str]], CleaningStats]:
+    humaneval = load_dataset("openai/openai_humaneval", split="test")
+    snippets = [
+        normalize_for_dedup({"instruction": row["prompt"], "input": "", "output": row["canonical_solution"]})
+        for row in humaneval
+    ]
+    return [snippet for snippet in snippets if len(snippet) >= min_chars]
+
+
+def is_benchmark_contaminated(example: dict[str, str], benchmark_snippets: list[str], window: int = 60) -> bool:
+    """Flag training examples that closely overlap with eval benchmark content."""
+    combined = normalize_for_dedup(example)
+    return any(snippet[:window] in combined for snippet in benchmark_snippets)
+
+def clean_records(
+    records: Iterable[dict[str, Any]],
+    benchmark_snippets: list[str] | None = None,
+) -> tuple[list[dict[str, str]], CleaningStats]:
     """Clean records, remove non-Python data, and deduplicate examples."""
     stats = CleaningStats()
     seen: set[str] = set()
@@ -91,6 +111,9 @@ def clean_records(records: Iterable[dict[str, Any]]) -> tuple[list[dict[str, str
             continue
         if not quality_ok(example):
             stats.quality_removed += 1
+            continue
+        if benchmark_snippets and is_benchmark_contaminated(example, benchmark_snippets):
+            stats.benchmark_removed += 1
             continue
         dedup_key = normalize_for_dedup(example)
         if dedup_key in seen:
@@ -163,7 +186,9 @@ def run_clean(records: list[dict[str, Any]] | None = None) -> tuple[list[dict[st
     """Clean raw records and save processed data plus stats."""
     if records is None:
         records = run_download() if not RAW_DATA_PATH.exists() else read_json(RAW_DATA_PATH)
-    cleaned, stats = clean_records(records)
+    logger.info("Loading HumanEval to screen for contamination")
+    benchmark_snippets = load_benchmark_snippets()
+    cleaned, stats = clean_records(records, benchmark_snippets=benchmark_snippets)
     write_json(CLEANED_DATA_PATH, cleaned)
     write_json(STATS_PATH, asdict(stats))
     logger.info("Cleaning stats: %s", asdict(stats))

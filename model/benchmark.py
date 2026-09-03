@@ -80,22 +80,30 @@ def generate_solution(
     num_samples: int,
 ) -> list[str]:
     """Generate one or more HumanEval solutions."""
-    input_text = format_prompt(prompt, task="generate")
+    input_text = format_prompt(prompt, tokenizer, task="generate")
     inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[-1]
     solutions: list[str] = []
 
     with torch.no_grad():
         for _ in range(num_samples):
-            outputs = model.generate(
+            
+            do_sample = temperature is not None and temperature > 0
+
+            generation_kwargs = {
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=temperature > 0,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "pad_token_id": tokenizer.eos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+
+            if do_sample:
+                generation_kwargs["temperature"] = temperature
+                generation_kwargs["top_p"] = top_p
+
+            outputs = model.generate(**generation_kwargs)
+
             response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
             solutions.append(f"{prompt}\n{extract_code(response)}")
     return solutions
@@ -168,10 +176,12 @@ def run_benchmark(
         results.append(
             {
                 "task_id": problem["task_id"],
+                "entry_point": problem["entry_point"],
                 "num_correct": num_correct,
                 "num_samples": num_samples,
                 "pass@1": pass_at_k(num_samples, num_correct, 1),
                 "errors": [result["error"] for result in problem_results if result["error"]],
+                "solutions": solutions,
             }
         )
         if (index + 1) % 20 == 0:
@@ -239,8 +249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", type=str, default=None, help="Optional tokenizer path or Hugging Face name.")
     parser.add_argument("--label", type=str, default="baseline", help="Result label.")
     parser.add_argument("--samples", type=int, default=1, help="Samples per problem.")
-    parser.add_argument("--temperature", type=float, default=cfg.inference.temperature)
-    parser.add_argument("--top-p", type=float, default=cfg.inference.top_p)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=cfg.inference.max_new_tokens)
     parser.add_argument("--max", type=int, default=None, help="Maximum HumanEval problems.")
     parser.add_argument("--compare", action="store_true", help="Compare baseline and fine-tuned reports.")

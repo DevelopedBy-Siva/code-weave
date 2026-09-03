@@ -28,12 +28,23 @@ def torch_dtype(precision: str) -> Any:
     raise ValueError(f"Unsupported precision: {precision}")
 
 
-def format_prompt(prompt: str, task: str = "generate") -> str:
-    """Format user input consistently for training-compatible generation."""
+def format_prompt(prompt: str, tokenizer: Any, task: str = "generate") -> str:
+    """Format user input using the model's native chat template."""
     if task not in INSTRUCTION_TEMPLATES:
-        raise ValueError(f"Unsupported task '{task}'. Expected one of {sorted(INSTRUCTION_TEMPLATES)}.")
-    instruction = INSTRUCTION_TEMPLATES[task]
-    return f"### Instruction:\n{instruction}\n\n### Input:\n{prompt.strip()}\n\n### Response:\n"
+        raise ValueError(
+            f"Unsupported task '{task}'. Expected one of {sorted(INSTRUCTION_TEMPLATES)}."
+        )
+
+    messages = [
+        {"role": "system", "content": INSTRUCTION_TEMPLATES[task]},
+        {"role": "user", "content": prompt.strip()},
+    ]
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 def load_tokenizer(model_name_or_path: str | Path) -> Any:
