@@ -97,6 +97,40 @@ def test_normalize_verified_opencode_record() -> None:
     }
 
 
+def test_normalize_open_r1_uses_decontaminated_problem_field() -> None:
+    """Open-R1's decontaminated split calls its prompt column ``problem``."""
+    record = {
+        "problem": "Solve this Python problem from standard input.",
+        "gold_standard_solution": "```python\nprint(input())\n```",
+    }
+
+    assert normalize_hf_record(
+        "open-r1/verifiable-coding-problems-python_decontaminated-tested", record
+    ) == {
+        "instruction": record["problem"],
+        "input": "",
+        "output": record["gold_standard_solution"],
+        "_solution_style": "script",
+    }
+
+
+def test_cleaning_stats_report_source_retention() -> None:
+    """Per-source counts expose schema errors that aggregate counts can hide."""
+    records = [
+        {
+            "instruction": "Write a Python function that adds two integers.",
+            "input": "",
+            "output": "def add(a, b):\n    return a + b",
+            "_source": "verified-source",
+        }
+    ]
+
+    _, stats, _ = clean_records(records)
+
+    assert stats.source_raw == {"verified-source": 1}
+    assert stats.source_kept == {"verified-source": 1}
+
+
 def test_clean_records_preserves_competitive_script_entrypoint() -> None:
     """A required solve() call is not a removable function demonstration."""
     output = "def solve():\n    print(input())\n\nsolve()"

@@ -8,7 +8,7 @@ import json
 import logging
 import difflib
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -19,7 +19,8 @@ RAW_DATA_PATH = RAW_DIR / "combined_data.json"
 RAW_METADATA_PATH = RAW_DIR / "dataset_manifest.json"
 CLEANED_DATA_PATH = PROCESSED_DIR / "cleaned_data.json"
 STATS_PATH = PROCESSED_DIR / "cleaning_stats.json"
-DATA_CLEANING_VERSION = 3
+DATA_CLEANING_VERSION = 4
+RAW_NORMALIZATION_VERSION = 2
 
 EOS_TOKENS = ("<EOS_TOKEN>", "</s>", "<eos>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 PYTHON_HINTS = ("def ", "class ", "import ", "from ", "return ", "print(", "for ", "while ", "if ", "try:", "except ")
@@ -54,6 +55,8 @@ class CleaningStats:
     duplicate_removed: int = 0
     benchmark_removed: int = 0
     kept: int = 0
+    source_raw: dict[str, int] = field(default_factory=dict)
+    source_kept: dict[str, int] = field(default_factory=dict)
 
 
 def strip_eos_tokens(text: str) -> tuple[str, int]:
@@ -281,6 +284,8 @@ def clean_records(
 
     for record in records:
         stats.raw += 1
+        source = str(record.get("_source", "unknown") or "unknown")
+        stats.source_raw[source] = stats.source_raw.get(source, 0) + 1
         instruction, removed_instruction = strip_eos_tokens(str(record.get("instruction", "") or ""))
         input_text, removed_input = strip_eos_tokens(str(record.get("input", "") or ""))
         output, removed_output = strip_eos_tokens(str(record.get("output", "") or ""))
@@ -318,6 +323,7 @@ def clean_records(
             continue
         seen.add(dedup_key)
         cleaned_records.append(example)
+        stats.source_kept[source] = stats.source_kept.get(source, 0) + 1
 
     stats.kept = len(cleaned_records)
     return cleaned_records, stats, flagged
@@ -327,7 +333,12 @@ def normalize_hf_record(dataset_name: str, record: dict[str, Any]) -> dict[str, 
     """Map a Hugging Face dataset row into instruction/input/output fields."""
     if dataset_name == "open-r1/verifiable-coding-problems-python_decontaminated-tested":
         return {
-            "instruction": str(record.get("problem_statement", "") or ""),
+            # The decontaminated dataset renamed this field from
+            # ``problem_statement`` to ``problem``. Supporting both names also
+            # makes the adapter resilient to upstream schema variants.
+            "instruction": str(
+                record.get("problem") or record.get("problem_statement") or ""
+            ),
             "input": "",
             "output": str(record.get("gold_standard_solution", "") or ""),
             "_solution_style": "script",
@@ -369,6 +380,7 @@ def download_records(load_dataset_fn: Callable[..., Any] | None = None) -> list[
             normalized = normalize_hf_record(dataset_name, dict(row))
             if normalized is None:
                 continue
+            normalized["_source"] = dataset_name
             all_records.append(normalized)
             kept += 1
         logger.info("  kept %s / %s rows", kept, before)
@@ -394,7 +406,11 @@ def run_download() -> list[dict[str, str]]:
     write_json(RAW_DATA_PATH, records)
     write_json(
         RAW_METADATA_PATH,
-        {"datasets": list(DATASETS), "record_count": len(records)},
+        {
+            "datasets": list(DATASETS),
+            "normalization_version": RAW_NORMALIZATION_VERSION,
+            "record_count": len(records),
+        },
     )
     logger.info("Saved %s raw records to %s", len(records), RAW_DATA_PATH)
     return records
@@ -407,15 +423,37 @@ def run_clean(records: list[dict[str, Any]] | None = None) -> tuple[list[dict[st
             records = run_download()
         else:
             manifest = read_json(RAW_METADATA_PATH) if RAW_METADATA_PATH.exists() else {}
-            if manifest.get("datasets") != list(DATASETS):
+            if (
+                manifest.get("datasets") != list(DATASETS)
+                or manifest.get("normalization_version") != RAW_NORMALIZATION_VERSION
+            ):
                 raise RuntimeError(
-                    "Raw data came from an obsolete dataset mixture; rerun with "
+                    "Raw data came from an obsolete dataset mixture or schema adapter; rerun with "
                     "`python data/download_datasets.py --download --clean --validate`."
                 )
             records = read_json(RAW_DATA_PATH)
     logger.info("Loading held-out HumanEval/MBPP signals to screen for contamination")
     benchmark_signals = load_benchmark_signals()
     cleaned, stats, flagged = clean_records(records, benchmark_signals=benchmark_signals)
+    starved_sources = {
+        spec["path"]: (
+            stats.source_kept.get(spec["path"], 0),
+            stats.source_raw.get(spec["path"], 0),
+        )
+        for spec in DATASETS
+        if stats.source_raw.get(spec["path"], 0) > 0
+        and stats.source_kept.get(spec["path"], 0)
+        < 0.10 * stats.source_raw[spec["path"]]
+    }
+    if starved_sources:
+        details = ", ".join(
+            f"{source} ({kept}/{raw} kept)"
+            for source, (kept, raw) in sorted(starved_sources.items())
+        )
+        raise RuntimeError(
+            "Cleaning retained under 10% of configured source(s): "
+            f"{details}. Check the upstream schema before training."
+        )
     write_json(CLEANED_DATA_PATH, cleaned)
     write_json(STATS_PATH, asdict(stats))
     write_json(PROCESSED_DIR / "benchmark_contamination_flagged.json", flagged)
