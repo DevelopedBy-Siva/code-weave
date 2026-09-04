@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
+import multiprocessing
 import re
 import sys
 import time
@@ -13,12 +15,12 @@ from math import comb
 from pathlib import Path
 from typing import Any
 
-import torch
-from datasets import load_dataset
-from tqdm import tqdm
-
-from config import default_config
-from model_registry import format_prompt, load_model as registry_load_model, load_tokenizer
+try:  # Support both script and package execution.
+    from .config import default_config
+    from .model_registry import format_prompt, load_model as registry_load_model, load_tokenizer
+except ImportError:
+    from config import default_config
+    from model_registry import format_prompt, load_model as registry_load_model, load_tokenizer
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = BASE_DIR / "benchmark_results"
@@ -51,23 +53,50 @@ def load_benchmark_model(model_path: str, tokenizer_path: str | None = None) -> 
     return model, tokenizer
 
 
+CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+CODE_START_RE = re.compile(
+    r"^(?:\s+\S|@|#|def\s|async\s+def\s|class\s|from\s|import\s|return\s|raise\s|if\s|for\s|while\s|try:|with\s)"
+)
+
+
 def extract_code(response: str) -> str:
-    """Clean the generated response into executable code."""
-    if "```python" in response:
-        response = response.split("```python", 1)[1].split("```", 1)[0]
-    elif "```" in response:
-        response = response.split("```", 1)[1].split("```", 1)[0]
+    """Remove response prose while preserving valid imports and indentation.
 
-    function_match = re.search(r"def\s+\w+\s*\(", response)
-    if function_match:
-        response = response[function_match.start() :]
+    Leading indentation is significant for HumanEval because many models emit a
+    function *completion* instead of repeating the full definition.  The old
+    ``strip()`` converted ``"    return x"`` to invalid top-level code.  It also
+    discarded imports before the first function and stopped at a second import.
+    """
+    fenced = CODE_FENCE_RE.findall(response)
+    if fenced:
+        return max(fenced, key=len).strip("\r\n")
 
-    clean_lines: list[str] = []
-    for line in response.splitlines():
-        if clean_lines and re.match(r"^[A-Za-z]", line) and not line.startswith(" "):
+    lines = response.strip("\r\n").splitlines()
+    for index, line in enumerate(lines):
+        if CODE_START_RE.match(line):
+            lines = lines[index:]
             break
-        clean_lines.append(line)
-    return "\n".join(clean_lines).strip()
+    return "\n".join(lines).rstrip()
+
+
+def build_solution(prompt: str, response: str) -> str:
+    """Combine a HumanEval prompt with the longest syntactically valid response.
+
+    The response may be either an indented continuation or a complete function.
+    Appending a complete definition is valid Python and intentionally replaces
+    the stub from the prompt.  Trailing natural-language lines are removed only
+    when needed to make the combined program parse.
+    """
+    code = extract_code(response)
+    lines = code.splitlines()
+    for end in range(len(lines), 0, -1):
+        solution = f"{prompt.rstrip()}\n{chr(10).join(lines[:end]).rstrip()}\n"
+        try:
+            ast.parse(solution)
+        except SyntaxError:
+            continue
+        return solution
+    return f"{prompt.rstrip()}\n{code.rstrip()}\n"
 
 
 def generate_solution(
@@ -80,6 +109,8 @@ def generate_solution(
     num_samples: int,
 ) -> list[str]:
     """Generate one or more HumanEval solutions."""
+    import torch
+
     input_text = format_prompt(prompt, tokenizer, task="generate")
     inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[-1]
@@ -87,7 +118,6 @@ def generate_solution(
 
     with torch.no_grad():
         for _ in range(num_samples):
-            
             do_sample = temperature is not None and temperature > 0
 
             generation_kwargs = {
@@ -105,27 +135,54 @@ def generate_solution(
             outputs = model.generate(**generation_kwargs)
 
             response = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-            solutions.append(f"{prompt}\n{extract_code(response)}")
+            solutions.append(build_solution(prompt, response))
     return solutions
 
 
-def run_tests_safely(solution: str, test_code: str, entry_point: str) -> dict[str, bool | str | None]:
-    """Execute HumanEval tests for one generated solution."""
+def _execution_worker(program: str, connection: Any) -> None:
+    """Execute generated code in an isolated child process."""
     result: dict[str, bool | str | None] = {"passed": False, "error": None}
     exec_globals: dict[str, Any] = {}
     try:
-        exec(solution, exec_globals)
-        if entry_point not in exec_globals:
-            result["error"] = f"Function '{entry_point}' not found in output"
-            return result
-        exec(test_code, exec_globals)
-        exec(f"check({entry_point})", exec_globals)
+        exec(program, exec_globals)
         result["passed"] = True
     except AssertionError as exc:
         result["error"] = f"AssertionError: {exc}"
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
+    connection.send(result)
+    connection.close()
+
+
+def run_program_safely(program: str, timeout_seconds: float = 10.0) -> dict[str, bool | str | None]:
+    """Run generated Python with a timeout so one loop cannot stall an evaluation."""
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(target=_execution_worker, args=(program, child_connection))
+    process.start()
+    child_connection.close()
+    process.join(timeout_seconds)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        parent_connection.close()
+        return {"passed": False, "error": f"Timeout after {timeout_seconds:g}s"}
+    if parent_connection.poll():
+        result = parent_connection.recv()
+    else:
+        result = {"passed": False, "error": f"Worker exited with code {process.exitcode}"}
+    parent_connection.close()
     return result
+
+
+def run_tests_safely(solution: str, test_code: str, entry_point: str) -> dict[str, bool | str | None]:
+    """Execute HumanEval tests for one generated solution."""
+    program = (
+        f"{solution}\n{test_code}\n"
+        f"assert {entry_point!r} in globals(), \"Function {entry_point!r} not found in output\"\n"
+        f"check({entry_point})\n"
+    )
+    return run_program_safely(program)
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -146,6 +203,9 @@ def run_benchmark(
     top_p: float | None = None,
 ) -> dict[str, Any]:
     """Run HumanEval and save a JSON benchmark report."""
+    from datasets import load_dataset
+    from tqdm import tqdm
+
     cfg = default_config()
     temperature = cfg.inference.temperature if temperature is None else temperature
     top_p = cfg.inference.top_p if top_p is None else top_p
@@ -217,8 +277,8 @@ def run_benchmark(
     return summary
 
 
-def compare_results() -> None:
-    """Compare saved baseline and fine-tuned benchmark reports."""
+def compare_results(min_improvement: float = 2.0, min_score: float = 80.0) -> None:
+    """Compare reports and require a meaningful fine-tuning improvement."""
     baseline_path = RESULTS_DIR / "baseline_results.json"
     finetuned_path = RESULTS_DIR / "finetuned_results.json"
     if not baseline_path.exists() or not finetuned_path.exists():
@@ -239,6 +299,17 @@ def compare_results() -> None:
     print(f"{'pass@1 (%)':<20} {baseline['pass@1']:>12.2f} {finetuned['pass@1']:>12.2f} {delta_pass1:>+10.2f}")
     print(f"{'Problems passed':<20} {baseline['num_passed']:>12} {finetuned['num_passed']:>12} {finetuned['num_passed'] - baseline['num_passed']:>+10}")
     print("=" * 60)
+    failures: list[str] = []
+    if finetuned["pass@1"] < min_score:
+        failures.append(
+            f"fine-tuned pass@1 {finetuned['pass@1']:.2f} is below {min_score:.2f}"
+        )
+    if delta_pass1 < min_improvement:
+        failures.append(
+            f"gain {delta_pass1:+.2f} is below required {min_improvement:+.2f} points"
+        )
+    if failures:
+        raise SystemExit(f"Quality gate failed: {'; '.join(failures)}.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +325,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=cfg.inference.max_new_tokens)
     parser.add_argument("--max", type=int, default=None, help="Maximum HumanEval problems.")
     parser.add_argument("--compare", action="store_true", help="Compare baseline and fine-tuned reports.")
+    parser.add_argument(
+        "--min-improvement",
+        type=float,
+        default=2.0,
+        help="Minimum pass@1 percentage-point gain required by --compare.",
+    )
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        default=80.0,
+        help="Minimum fine-tuned pass@1 percentage required by --compare.",
+    )
     return parser.parse_args()
 
 
@@ -262,7 +345,10 @@ def main() -> None:
     setup_logging()
     args = parse_args()
     if args.compare:
-        compare_results()
+        compare_results(
+            min_improvement=args.min_improvement,
+            min_score=args.min_score,
+        )
         return
     if not args.model:
         print("Error: --model is required unless using --compare")

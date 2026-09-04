@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import difflib
@@ -15,17 +16,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 RAW_DATA_PATH = RAW_DIR / "combined_data.json"
+RAW_METADATA_PATH = RAW_DIR / "dataset_manifest.json"
 CLEANED_DATA_PATH = PROCESSED_DIR / "cleaned_data.json"
 STATS_PATH = PROCESSED_DIR / "cleaning_stats.json"
+DATA_CLEANING_VERSION = 3
 
 EOS_TOKENS = ("<EOS_TOKEN>", "</s>", "<eos>", "<|endoftext|>", "<|eot_id|>", "<|im_end|>")
 PYTHON_HINTS = ("def ", "class ", "import ", "from ", "return ", "print(", "for ", "while ", "if ", "try:", "except ")
+# Quality matters more than volume when adapting an already strong code model.
+# The Open-R1 set is decontaminated and its reference answers passed executable
+# tests. OpenCodeInstruct-50k supplies HumanEval-like function/class tasks whose
+# solutions passed all ten generated tests and strict quality judging. The
+# previous unverified 100k mixture caused the observed catastrophic forgetting
+# and is intentionally excluded.
 DATASETS: tuple[dict[str, str], ...] = (
-    {"path": "Vezora/Tested-22k-Python-Alpaca", "split": "train"},
-    {"path": "iamtarun/python_code_instructions_18k_alpaca", "split": "train"},
-    {"path": "flytech/python-codes-25k", "split": "train"},
-    {"path": "ise-uiuc/Magicoder-OSS-Instruct-75K", "split": "train"},
-    {"path": "sahil2801/CodeAlpaca-20k", "split": "train"},
+    {
+        "path": "open-r1/verifiable-coding-problems-python_decontaminated-tested",
+        "split": "train",
+    },
+    {"path": "LLMSafety/OpenCodeInstruct-50k", "split": "train"},
 )
 
 logger = logging.getLogger(__name__)
@@ -35,10 +44,13 @@ logger = logging.getLogger(__name__)
 class CleaningStats:
     """Counts recorded while cleaning the merged dataset."""
 
+    cleaning_version: int = DATA_CLEANING_VERSION
     raw: int = 0
     eos_removed: int = 0
     non_python_removed: int = 0
     quality_removed: int = 0
+    invalid_python_removed: int = 0
+    demo_sections_removed: int = 0
     duplicate_removed: int = 0
     benchmark_removed: int = 0
     kept: int = 0
@@ -62,8 +74,13 @@ def looks_like_python(example: dict[str, str]) -> bool:
 
 
 def normalize_for_dedup(example: dict[str, str]) -> str:
-    """Build a stable deduplication key from instruction, input, and output."""
-    text = "\n".join([example.get("instruction", ""), example.get("input", ""), example.get("output", "")])
+    """Build a stable key for a task, regardless of small answer differences.
+
+    Deduplicating on the answer as well as the prompt allowed the same task with
+    several near-identical answers to land in both train and validation.  That
+    made validation loss look better without measuring generalization.
+    """
+    text = "\n".join([example.get("instruction", ""), example.get("input", "")])
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
@@ -72,6 +89,113 @@ def quality_ok(example: dict[str, str]) -> bool:
     instruction = example.get("instruction", "").strip()
     output = example.get("output", "").strip()
     return 10 <= len(instruction) and 20 <= len(output) <= 8_000
+
+
+CODE_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+
+
+def extract_python_output(text: str) -> str:
+    """Return code from a model-style answer, removing Markdown commentary.
+
+    Instruction datasets frequently wrap otherwise good solutions in prose and
+    fences.  Training that presentation style makes a completion benchmark less
+    reliable, so cleaned targets contain code only.  When several blocks exist,
+    the largest parseable Python block is preferred.
+    """
+    blocks = [block.strip() for block in CODE_FENCE_RE.findall(text)]
+    parseable = [block for block in blocks if is_valid_python(block)]
+    if parseable:
+        return max(parseable, key=len)
+    return text.strip()
+
+
+def is_valid_python(code: str) -> bool:
+    """Return whether *code* is a complete, substantive Python program."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+
+    substantive_nodes = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Import,
+        ast.ImportFrom,
+        ast.Assign,
+        ast.AnnAssign,
+        ast.For,
+        ast.While,
+        ast.If,
+        ast.Try,
+        ast.With,
+        ast.Expr,
+    )
+    nodes = [node for node in tree.body if isinstance(node, substantive_nodes)]
+    # A lone string is usually prose or a docstring rather than a solution.
+    return bool(nodes) and not (
+        len(nodes) == 1
+        and isinstance(nodes[0], ast.Expr)
+        and isinstance(nodes[0].value, ast.Constant)
+        and isinstance(nodes[0].value.value, str)
+    )
+
+
+def strip_demo_code(code: str) -> tuple[str, bool]:
+    """Remove obvious top-level tests/examples after function definitions.
+
+    Many otherwise useful Alpaca answers append assertions, ``print`` calls, or
+    a ``__main__`` demo. Teaching those suffixes wastes the generation budget
+    and makes benchmark completions less reliable.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code, False
+
+    defined_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if not defined_names:
+        return code, False
+
+    def call_name(node: ast.AST | None) -> str | None:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return node.func.id
+        return None
+
+    def is_main_guard(node: ast.AST) -> bool:
+        if not isinstance(node, ast.If):
+            return False
+        test = node.test
+        return (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+        )
+
+    kept: list[ast.stmt] = []
+    removed = False
+    for node in tree.body:
+        remove = isinstance(node, ast.Assert) or is_main_guard(node)
+        if isinstance(node, ast.Expr):
+            remove = remove or call_name(node.value) in {*defined_names, "print"}
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value
+            remove = remove or call_name(value) in defined_names
+        if remove:
+            removed = True
+        else:
+            kept.append(node)
+
+    if not removed:
+        return code, False
+    tree.body = kept
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree).strip(), True
+
 
 def normalize_code(text: str) -> str:
     """Collapse whitespace for code-level comparison, ignoring formatting differences."""
@@ -82,7 +206,7 @@ FUNC_DEF_RE = re.compile(r"def\s+(\w+)\s*\(")
 
 
 def load_benchmark_signals(min_solution_chars: int = 40) -> dict[str, dict[str, str]]:
-    """Load HumanEval solutions and problem text, keyed by entry_point, to screen training data against."""
+    """Load held-out benchmark text used to screen the training corpus."""
     from datasets import load_dataset
 
     humaneval = load_dataset("openai/openai_humaneval", split="test")
@@ -93,8 +217,21 @@ def load_benchmark_signals(min_solution_chars: int = 40) -> dict[str, dict[str, 
             continue
         signals[row["entry_point"]] = {
             "task_id": row["task_id"],
+            "entry_point": row["entry_point"],
             "prompt_norm": normalize_code(row["prompt"]),
             "solution_norm": solution_norm,
+        }
+
+    # MBPP validation is used only for checkpoint selection. Remove exact prompt
+    # matches from SFT data so that checkpoint selection remains held out.
+    mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="validation")
+    for row in mbpp:
+        function_names = FUNC_DEF_RE.findall(row["code"])
+        signals[f"mbpp:{row['task_id']}"] = {
+            "task_id": f"MBPP/{row['task_id']}",
+            "entry_point": function_names[0] if function_names else "",
+            "prompt_norm": normalize_code(row["prompt"]),
+            "solution_norm": normalize_code(row["code"]),
         }
     return signals
 
@@ -113,12 +250,15 @@ def is_benchmark_contaminated(
     output_norm = normalize_code(output)
 
     for name in FUNC_DEF_RE.findall(output):
-        signal = signals.get(name)
-        if signal is None:
-            continue
-        ratio = difflib.SequenceMatcher(None, output_norm, signal["solution_norm"]).quick_ratio()
-        if ratio >= code_ratio_threshold:
-            return True, f"code match: {signal['task_id']} (entry_point={name}, ratio={ratio:.2f})"
+        matching_signals = [
+            signal for signal in signals.values() if signal.get("entry_point") == name
+        ]
+        for signal in matching_signals:
+            ratio = difflib.SequenceMatcher(
+                None, output_norm, signal["solution_norm"]
+            ).quick_ratio()
+            if ratio >= code_ratio_threshold:
+                return True, f"code match: {signal['task_id']} (entry_point={name}, ratio={ratio:.2f})"
 
     instruction_input_norm = normalize_code(f"{example.get('instruction', '')} {example.get('input', '')}")
     for signal in signals.values():
@@ -127,6 +267,7 @@ def is_benchmark_contaminated(
             return True, f"prompt-text match: {signal['task_id']}"
 
     return False, ""
+
 
 def clean_records(
     records: Iterable[dict[str, Any]],
@@ -145,12 +286,25 @@ def clean_records(
         output, removed_output = strip_eos_tokens(str(record.get("output", "") or ""))
         stats.eos_removed += removed_instruction + removed_input + removed_output
 
-        example = {"instruction": instruction, "input": input_text, "output": output}
+        code_output = extract_python_output(output)
+        if record.get("_solution_style") == "script":
+            demo_removed = False
+        else:
+            code_output, demo_removed = strip_demo_code(code_output)
+        stats.demo_sections_removed += int(demo_removed)
+        example = {
+            "instruction": instruction,
+            "input": input_text,
+            "output": code_output,
+        }
         if not looks_like_python(example):
             stats.non_python_removed += 1
             continue
         if not quality_ok(example):
             stats.quality_removed += 1
+            continue
+        if not is_valid_python(example["output"]):
+            stats.invalid_python_removed += 1
             continue
         if benchmark_signals:
             contaminated, reason = is_benchmark_contaminated(example, benchmark_signals)
@@ -171,6 +325,23 @@ def clean_records(
 
 def normalize_hf_record(dataset_name: str, record: dict[str, Any]) -> dict[str, str] | None:
     """Map a Hugging Face dataset row into instruction/input/output fields."""
+    if dataset_name == "open-r1/verifiable-coding-problems-python_decontaminated-tested":
+        return {
+            "instruction": str(record.get("problem_statement", "") or ""),
+            "input": "",
+            "output": str(record.get("gold_standard_solution", "") or ""),
+            "_solution_style": "script",
+        }
+
+    if dataset_name == "LLMSafety/OpenCodeInstruct-50k":
+        if float(record.get("average_test_score", 0.0) or 0.0) < 1.0:
+            return None
+        return {
+            "instruction": str(record.get("input", "") or ""),
+            "input": "",
+            "output": str(record.get("output", "") or ""),
+        }
+
     if dataset_name == "ise-uiuc/Magicoder-OSS-Instruct-75K":
         if str(record.get("lang", "")).lower() != "python":
             return None
@@ -221,6 +392,10 @@ def run_download() -> list[dict[str, str]]:
     """Download datasets and save the merged raw JSON file."""
     records = download_records()
     write_json(RAW_DATA_PATH, records)
+    write_json(
+        RAW_METADATA_PATH,
+        {"datasets": list(DATASETS), "record_count": len(records)},
+    )
     logger.info("Saved %s raw records to %s", len(records), RAW_DATA_PATH)
     return records
 
@@ -228,14 +403,22 @@ def run_download() -> list[dict[str, str]]:
 def run_clean(records: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, str]], CleaningStats, list[dict[str, str]]]:
     """Clean raw records and save processed data plus stats."""
     if records is None:
-        records = run_download() if not RAW_DATA_PATH.exists() else read_json(RAW_DATA_PATH)
-    logger.info("Loading HumanEval to screen for contamination")
+        if not RAW_DATA_PATH.exists():
+            records = run_download()
+        else:
+            manifest = read_json(RAW_METADATA_PATH) if RAW_METADATA_PATH.exists() else {}
+            if manifest.get("datasets") != list(DATASETS):
+                raise RuntimeError(
+                    "Raw data came from an obsolete dataset mixture; rerun with "
+                    "`python data/download_datasets.py --download --clean --validate`."
+                )
+            records = read_json(RAW_DATA_PATH)
+    logger.info("Loading held-out HumanEval/MBPP signals to screen for contamination")
     benchmark_signals = load_benchmark_signals()
     cleaned, stats, flagged = clean_records(records, benchmark_signals=benchmark_signals)
     write_json(CLEANED_DATA_PATH, cleaned)
     write_json(STATS_PATH, asdict(stats))
-    if flagged:
-        write_json(PROCESSED_DIR / "benchmark_contamination_flagged.json", flagged)
+    write_json(PROCESSED_DIR / "benchmark_contamination_flagged.json", flagged)
     logger.info("Cleaning stats: %s", asdict(stats))
     logger.info("Saved %s cleaned records to %s", len(cleaned), CLEANED_DATA_PATH)
     return cleaned, stats, flagged
@@ -246,12 +429,25 @@ def run_validate() -> None:
     if not CLEANED_DATA_PATH.exists():
         raise FileNotFoundError(f"Missing processed dataset: {CLEANED_DATA_PATH}")
     records = read_json(CLEANED_DATA_PATH)
+    stats = read_json(STATS_PATH) if STATS_PATH.exists() else {}
+    if stats.get("cleaning_version") != DATA_CLEANING_VERSION:
+        raise ValueError(
+            "Processed data was created by an obsolete cleaner; rerun "
+            "`python data/download_datasets.py --clean --validate`."
+        )
     if not isinstance(records, list) or not records:
         raise ValueError("Processed dataset must be a non-empty JSON list.")
     required = {"instruction", "input", "output"}
-    bad_rows = [idx for idx, row in enumerate(records[:1_000]) if set(row) != required]
-    if bad_rows:
-        raise ValueError(f"Rows with invalid schema in first 1000 records: {bad_rows[:10]}")
+    seen_tasks: set[str] = set()
+    for index, row in enumerate(records):
+        if not isinstance(row, dict) or set(row) != required:
+            raise ValueError(f"Row {index} has an invalid schema")
+        if not is_valid_python(row["output"]):
+            raise ValueError(f"Row {index} has an invalid Python target")
+        task_key = normalize_for_dedup(row)
+        if task_key in seen_tasks:
+            raise ValueError(f"Row {index} duplicates an earlier instruction/input pair")
+        seen_tasks.add(task_key)
     logger.info("Validated %s cleaned samples at %s", len(records), CLEANED_DATA_PATH)
 
 

@@ -5,10 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from config import default_config
+try:  # Support both script and package execution.
+    from .config import default_config
+except ImportError:
+    from config import default_config
 
 INSTRUCTION_TEMPLATES = {
-    "generate": "Write Python code for the following request.",
+    "generate": (
+        "Solve the following request with correct, executable Python code. "
+        "Return only code, without Markdown fences or an explanation."
+    ),
     "explain": "Explain the following Python code clearly and concisely.",
     "review": "Review the following Python code for correctness, clarity, and risks.",
     "chat": "You are a helpful Python coding assistant.",
@@ -58,10 +64,23 @@ def load_tokenizer(model_name_or_path: str | Path) -> Any:
 
 
 def load_model(model_name_or_path: str | Path) -> Any:
-    """Load a causal language model for inference or evaluation."""
+    """Load a merged model or a local PEFT checkpoint for evaluation."""
     from transformers import AutoModelForCausalLM
 
     cfg = default_config()
+    model_path = Path(model_name_or_path)
+    if model_path.is_dir() and (model_path / "adapter_config.json").exists():
+        from peft import AutoPeftModelForCausalLM
+
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            str(model_path),
+            torch_dtype=torch_dtype(cfg.model.precision),
+            device_map="auto",
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        model.eval()
+        return model
+
     model = AutoModelForCausalLM.from_pretrained(
         str(model_name_or_path),
         torch_dtype=torch_dtype(cfg.model.precision),

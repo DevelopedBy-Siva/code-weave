@@ -36,9 +36,14 @@ class FakeTokenizer:
 
     eos_token_id = 0
 
+    def apply_chat_template(self, messages: list[dict[str, str]], tokenize: bool, add_generation_prompt: bool) -> str:
+        assert tokenize is False
+        assert add_generation_prompt is True
+        return f"system: {messages[0]['content']}\nuser: {messages[1]['content']}\nassistant:"
+
     def __call__(self, text: str, return_tensors: str) -> FakeInputs:
         assert return_tensors == "pt"
-        assert "### Instruction:" in text
+        assert "correct, executable Python code" in text
         return FakeInputs({"input_ids": FakeIds(length=3)})
 
     def decode(self, ids: Any, skip_special_tokens: bool) -> str:

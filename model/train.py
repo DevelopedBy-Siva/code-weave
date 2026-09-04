@@ -3,23 +3,29 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
-from unsloth import FastLanguageModel
-
 import torch
 from datasets import Dataset
 from transformers import DataCollatorForSeq2Seq, EarlyStoppingCallback, Trainer, TrainingArguments
 
-from config import AppConfig, add_config_arguments, apply_overrides, default_config
-from model_registry import INSTRUCTION_TEMPLATES, save_merged_model
+try:  # Support both ``python model/train.py`` and ``python -m model.train``.
+    from .config import AppConfig, add_config_arguments, apply_overrides, default_config
+    from .model_registry import INSTRUCTION_TEMPLATES, torch_dtype
+    from .training_data import make_completion_variant
+except ImportError:
+    from config import AppConfig, add_config_arguments, apply_overrides, default_config
+    from model_registry import INSTRUCTION_TEMPLATES, torch_dtype
+    from training_data import make_completion_variant
 
 TRAINING_LOG = Path(__file__).resolve().parent / "training.log"
 logger = logging.getLogger(__name__)
+REQUIRED_CLEANING_VERSION = 3
 
 
 def setup_logging() -> None:
@@ -39,33 +45,66 @@ def load_clean_dataset(config: AppConfig) -> Dataset:
         )
     with config.cleaned_data_path.open("r", encoding="utf-8") as handle:
         records = json.load(handle)
+    stats_path = config.cleaned_data_path.with_name("cleaning_stats.json")
+    stats = {}
+    if stats_path.exists():
+        with stats_path.open("r", encoding="utf-8") as handle:
+            stats = json.load(handle)
+    if stats.get("cleaning_version") != REQUIRED_CLEANING_VERSION:
+        raise RuntimeError(
+            "The dataset predates the code-quality cleaner. Rerun "
+            "`python data/download_datasets.py --download --clean --validate` before training."
+        )
     logger.info("Loaded %s cleaned samples from %s", len(records), config.cleaned_data_path)
     return Dataset.from_list(records)
 
 
 def tokenize_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> Dataset:
-    """Tokenize examples using the chat template, masking the prompt from the loss."""
+    """Tokenize complete chat turns and train only on assistant tokens.
+
+    The full assistant turn is rendered by the tokenizer rather than manually
+    appending an EOS token.  This keeps Qwen's ``<|im_end|>`` boundaries exact.
+    Over-length rows are discarded instead of truncating the end of a solution
+    and teaching the model incomplete code.
+    """
 
     def tokenize(example: dict[str, str]) -> dict[str, Any]:
         user_content = example["instruction"].strip()
         if example.get("input", "").strip():
             user_content += f"\n\n{example['input'].strip()}"
-        messages = [
+        prompt_messages = [
             {"role": "system", "content": INSTRUCTION_TEMPLATES["generate"]},
             {"role": "user", "content": user_content},
         ]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        full_text = prompt_text + example["output"].strip() + tokenizer.eos_token
+        full_messages = [
+            *prompt_messages,
+            {"role": "assistant", "content": example["output"].strip("\r\n")},
+        ]
+        prompt_text = tokenizer.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True
+        )
+        full_text = tokenizer.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False
+        )
 
-        prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
-        result = tokenizer(full_text, truncation=True, max_length=config.model.max_seq_length, add_special_tokens=False)
+        prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        result = tokenizer(full_text, truncation=False, add_special_tokens=False)
+        full_ids = result["input_ids"]
 
-        labels = result["input_ids"].copy()
-        masked_len = min(prompt_len, len(labels))
-        labels[:masked_len] = [-100] * masked_len
+        # Tokenization at the prompt/answer string boundary can merge a token for
+        # some tokenizers.  The actual common prefix is the safe masking boundary.
+        prompt_len = 0
+        for prompt_id, full_id in zip(prompt_ids, full_ids):
+            if prompt_id != full_id:
+                break
+            prompt_len += 1
+
+        labels = full_ids.copy()
+        labels[:prompt_len] = [-100] * prompt_len
 
         result["labels"] = labels
-        result["has_supervision"] = any(label != -100 for label in labels)
+        result["supervised_tokens"] = len(labels) - prompt_len
+        result["within_context"] = len(full_ids) <= config.model.max_seq_length
         return result
 
     tokenized = dataset.map(
@@ -75,35 +114,81 @@ def tokenize_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> Dat
     )
 
     before_filter = len(tokenized)
-    tokenized = tokenized.filter(lambda example: example["has_supervision"], num_proc=4)
-    tokenized = tokenized.remove_columns(["has_supervision"])
+    tokenized = tokenized.filter(
+        lambda example: example["within_context"] and example["supervised_tokens"] > 1,
+        num_proc=4,
+    )
+    supervised_tokens = sum(tokenized["supervised_tokens"]) if len(tokenized) else 0
+    tokenized = tokenized.remove_columns(["within_context", "supervised_tokens"])
 
     logger.info(
-        "Tokenized %s samples; kept %s with supervised response tokens",
+        "Tokenized %s samples; kept %s complete rows with %s supervised tokens",
         before_filter,
         len(tokenized),
+        f"{supervised_tokens:,}",
     )
+    if not len(tokenized):
+        raise ValueError("No complete, supervised examples fit within max_seq_length")
     return tokenized
 
+
+def augment_completion_examples(dataset: Dataset, ratio: float) -> Dataset:
+    """Add deterministic completion variants without crossing split boundaries."""
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("completion_augmentation_ratio must be between 0 and 1")
+    records = [dict(example) for example in dataset]
+    variants: list[dict[str, str]] = []
+    threshold = int(ratio * 10_000)
+    for example in records:
+        digest = hashlib.sha256(
+            f"{example['instruction']}\n{example.get('input', '')}".encode("utf-8")
+        ).digest()
+        bucket = int.from_bytes(digest[:4], "big") % 10_000
+        if bucket >= threshold:
+            continue
+        variant = make_completion_variant(example)
+        if variant is not None:
+            variants.append(variant)
+    logger.info("Added %s completion-style variants to %s source tasks", len(variants), len(records))
+    return Dataset.from_list([*records, *variants])
+
+
 def prepare_dataset(dataset: Dataset, tokenizer: Any, config: AppConfig) -> tuple[Dataset, Dataset]:
-    """Tokenize and split the dataset into train/eval sets."""
+    """Split by source task, augment within each split, and tokenize."""
     if config.training.max_samples and len(dataset) > config.training.max_samples:
         dataset = dataset.shuffle(seed=config.training.seed).select(range(config.training.max_samples))
 
-    tokenized = tokenize_dataset(dataset, tokenizer, config)
-    split = tokenized.train_test_split(test_size=config.training.val_split, seed=config.training.seed)
-    logger.info("Train: %s | Val: %s", len(split["train"]), len(split["test"]))
-    return split["train"], split["test"]
+    if len(dataset) < 2:
+        raise ValueError("At least two examples are required for a train/eval split")
+    raw_split = dataset.train_test_split(
+        test_size=config.training.val_split, seed=config.training.seed
+    )
+    train_source = augment_completion_examples(
+        raw_split["train"], config.training.completion_augmentation_ratio
+    )
+    eval_source = augment_completion_examples(
+        raw_split["test"], config.training.completion_augmentation_ratio
+    )
+    train_dataset = tokenize_dataset(train_source, tokenizer, config)
+    eval_dataset = tokenize_dataset(eval_source, tokenizer, config)
+    if not len(train_dataset) or not len(eval_dataset):
+        raise ValueError("At least two tokenized examples are required for a train/eval split")
+    logger.info("Train: %s | Val: %s", len(train_dataset), len(eval_dataset))
+    return train_dataset, eval_dataset
 
 
 def load_lora_model(config: AppConfig) -> tuple[Any, Any]:
     """Load the base model and attach LoRA adapters."""
+    # Keep this import local so data/tokenization tests do not require a CUDA
+    # Unsloth installation.
+    from unsloth import FastLanguageModel
+
     logger.info("Loading model: %s", config.model.model_name)
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=config.model.model_name,
         max_seq_length=config.model.max_seq_length,
         load_in_4bit=config.model.load_in_4bit,
-        dtype=torch.bfloat16,
+        dtype=torch_dtype(config.model.precision),
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -182,15 +267,19 @@ def train_model(model: Any, tokenizer: Any, train_dataset: Dataset, eval_dataset
 
 
 def save_model_artifacts(model: Any, tokenizer: Any, config: AppConfig) -> None:
-    """Save LoRA adapter and merged model artifacts."""
+    """Save the eval-loss winner as an adapter for diagnostics.
+
+    A merged deployment model is intentionally created only after executable
+    checkpoint selection; token-level validation loss cannot promote a model.
+    """
     adapter_path = config.output_dir / "lora_adapter"
-    merged_path = config.output_dir / "merged_model"
     adapter_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(adapter_path))
     tokenizer.save_pretrained(str(adapter_path))
     logger.info("LoRA adapter saved to %s", adapter_path)
-    save_merged_model(model, tokenizer, merged_path)
-    logger.info("Merged model saved to %s", merged_path)
+    logger.info(
+        "Run model/select_checkpoint.py to select by executable validation and create the merged model"
+    )
 
 
 def parse_args() -> argparse.Namespace:

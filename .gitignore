@@ -23,7 +23,7 @@ htmlcov/
 *.pth
 *.bin
 *.safetensors
-model/qwen-python-finetuned/
+model/qwen-python-finetuned*/
 model/benchmark_results/
 
 # Training artifacts

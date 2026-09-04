@@ -31,9 +31,11 @@ class ModelConfig:
 class LoRAConfig:
     """LoRA adapter hyperparameters."""
 
-    r: int = 64
-    alpha: int = 128
-    dropout: float = 0.0
+    # Keep the adapter deliberately small.  The base Coder model is already
+    # strong; a 161M-parameter adapter at 2e-4 caused catastrophic forgetting.
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
     target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
@@ -42,24 +44,25 @@ class TrainingConfig:
     """Training hyperparameters."""
 
     num_train_epochs: int = 1
-    learning_rate: float = 2e-4
+    learning_rate: float = 5e-5
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
-    warmup_steps: int = 100
+    warmup_steps: int = 250
     lr_scheduler_type: str = "cosine"
     weight_decay: float = 0.01
     bf16: bool = True
     fp16: bool = False
     logging_steps: int = 25
-    save_steps: int = 500
-    eval_steps: int = 500
-    save_total_limit: int = 3
+    save_steps: int = 250
+    eval_steps: int = 250
+    save_total_limit: int = 20
     load_best_model_at_end: bool = True
     optim: str = "adamw_8bit"
     seed: int = 42
     val_split: float = 0.02
     max_samples: int | None = None
+    completion_augmentation_ratio: float = 0.25
 
 
 @dataclass(slots=True)

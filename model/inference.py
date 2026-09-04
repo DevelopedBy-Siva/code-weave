@@ -8,8 +8,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from config import InferenceConfig, default_config
-from model_registry import format_prompt, load_model, load_tokenizer
+try:  # Support both script and package execution.
+    from .config import InferenceConfig, default_config
+    from .model_registry import format_prompt, load_model, load_tokenizer
+except ImportError:
+    from config import InferenceConfig, default_config
+    from model_registry import format_prompt, load_model, load_tokenizer
 
 SUPPORTED_TASKS = ("generate", "explain", "review", "chat")
 
